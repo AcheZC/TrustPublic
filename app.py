@@ -1,4 +1,5 @@
 import os
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
@@ -7,13 +8,19 @@ from sqlalchemy.exc import IntegrityError
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ---- DB URL: adaptar mysql:// -> mysql+pymysql:// y forzar SSL ----
+# --- Normaliza DATABASE_URL para MySQL + PyMySQL y fuerza SSL correcto ---
 raw_url = os.getenv("DATABASE_URL", "")
+
+# Cambia mysql:// -> mysql+pymysql://
 if raw_url.startswith("mysql://"):
     raw_url = raw_url.replace("mysql://", "mysql+pymysql://", 1)
-# Clever-Cloud suele requerir SSL; si no hay flag, lo añadimos
-if ("?ssl=" not in raw_url) and ("&ssl=" not in raw_url) and ("?sslmode=" not in raw_url):
-    raw_url += ("&" if "?" in raw_url else "?") + "ssl_mode=REQUIRED"
+
+# Quita 'sslmode' si viene (propio de Postgres) y agrega 'ssl_mode=REQUIRED'
+u = urlparse(raw_url)
+q = dict(parse_qsl(u.query, keep_blank_values=True))
+q.pop("sslmode", None)              # elimina basura de Postgres
+q.setdefault("ssl_mode", "REQUIRED")  # exige SSL en MySQL/PyMySQL
+raw_url = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 app.config["SQLALCHEMY_DATABASE_URI"] = raw_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -29,7 +36,6 @@ class User(db.Model):
     password = db.Column(db.String(120), nullable=False)  # TODO: hash
     code     = db.Column(db.String(120))
 
-# --------- Rutas ---------
 @app.get("/health")
 def health():
     return jsonify(ok=True)
