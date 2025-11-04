@@ -13,7 +13,7 @@ if raw_url.startswith("mysql://"):
     raw_url = raw_url.replace("mysql://", "mysql+pymysql://", 1)
 # Clever-Cloud suele requerir SSL; si no hay flag, lo añadimos
 if ("?ssl=" not in raw_url) and ("&ssl=" not in raw_url) and ("?sslmode=" not in raw_url):
-    raw_url += ("&" if "?" in raw_url else "?") + "ssl=true"
+    raw_url += ("&" if "?" in raw_url else "?") + "ssl_mode=REQUIRED"
 
 app.config["SQLALCHEMY_DATABASE_URI"] = raw_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
