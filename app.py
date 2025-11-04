@@ -5,33 +5,36 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import IntegrityError
 
 app = Flask(__name__)
-# En dev dejamos CORS abierto; luego lo restringimos.
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Conexión a Clever Cloud (Render leerá DATABASE_URL del entorno)
+# Conexión a Clever Cloud (Render la lee de env)
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
 db = SQLAlchemy(app)
 
 # --------- Modelo ---------
 class User(db.Model):
     __tablename__ = "users"
-    id      = db.Column(db.Integer, primary_key=True)
-    name    = db.Column(db.String(80), nullable=False)
-    handle  = db.Column(db.String(50), nullable=False, unique=True)
-    email   = db.Column(db.String(120), nullable=False, unique=True)
-    password= db.Column(db.String(120), nullable=False)  # luego: hash
-    code    = db.Column(db.String(120))
+    id       = db.Column(db.Integer, primary_key=True)
+    name     = db.Column(db.String(80),  nullable=False)
+    handle   = db.Column(db.String(50),  nullable=False, unique=True)
+    email    = db.Column(db.String(120), nullable=False, unique=True)
+    password = db.Column(db.String(120), nullable=False)  # TODO: hash
+    code     = db.Column(db.String(120))
 
-# Crear tablas al arrancar (solo crea si no existen)
-with app.app_context():
-    db.create_all()
-
-# --------- Rutas ---------
 @app.get("/health")
 def health():
     return jsonify(ok=True)
+
+# Inicialización segura (manual)
+@app.get("/init-db")
+def init_db():
+    try:
+        db.create_all()
+        return jsonify(ok=True, msg="Tablas listas")
+    except Exception as e:
+        # Devuelve el error para depurar si algo falla
+        return (f"DB init error: {e}", 500)
 
 @app.post("/auth/register")
 def register():
@@ -55,7 +58,7 @@ def register():
         return ("Email o usuario ya registrados.", 409)
     except Exception as e:
         db.session.rollback()
-        return (f"Error del servidor: {str(e)}", 500)
+        return (f"Error del servidor: {e}", 500)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
