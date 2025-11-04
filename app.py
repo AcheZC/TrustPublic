@@ -7,8 +7,15 @@ from sqlalchemy.exc import IntegrityError
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Conexión a Clever Cloud (Render la lee de env)
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+# ---- DB URL: adaptar mysql:// -> mysql+pymysql:// y forzar SSL ----
+raw_url = os.getenv("DATABASE_URL", "")
+if raw_url.startswith("mysql://"):
+    raw_url = raw_url.replace("mysql://", "mysql+pymysql://", 1)
+# Clever-Cloud suele requerir SSL; si no hay flag, lo añadimos
+if ("?ssl=" not in raw_url) and ("&ssl=" not in raw_url) and ("?sslmode=" not in raw_url):
+    raw_url += ("&" if "?" in raw_url else "?") + "ssl=true"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = raw_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
@@ -22,18 +29,18 @@ class User(db.Model):
     password = db.Column(db.String(120), nullable=False)  # TODO: hash
     code     = db.Column(db.String(120))
 
+# --------- Rutas ---------
 @app.get("/health")
 def health():
     return jsonify(ok=True)
 
-# Inicialización segura (manual)
+# Inicializa tablas manualmente (llámalo una vez)
 @app.get("/init-db")
 def init_db():
     try:
         db.create_all()
         return jsonify(ok=True, msg="Tablas listas")
     except Exception as e:
-        # Devuelve el error para depurar si algo falla
         return (f"DB init error: {e}", 500)
 
 @app.post("/auth/register")
