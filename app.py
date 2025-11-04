@@ -3,8 +3,10 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-# Permitir llamadas desde systeme.io (puedes agregar tu dominio propio si lo usas)
-CORS(app, resources={r"/*": {"origins": ["https://*.systeme.io"]}})
+
+# 🔓 En modo desarrollo: permitir todas las conexiones (evita error "Failed to fetch")
+# Luego, cuando todo funcione, cambiamos "*" por los dominios específicos
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.get("/health")
 def health():
@@ -16,7 +18,7 @@ def register():
     required = ["name", "handle", "email", "password"]
     if any(not data.get(k) for k in required):
         return ("Faltan campos", 400)
-    # MOCK: aún sin BD. Solo confirma que llegó bien.
+    # MOCK: aún sin base de datos, solo confirma que llegó bien
     return jsonify(ok=True, msg="Cuenta creada (mock)."), 201
 
 if __name__ == "__main__":
