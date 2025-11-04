@@ -8,22 +8,25 @@ from sqlalchemy.exc import IntegrityError
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- Normaliza DATABASE_URL para MySQL + PyMySQL y fuerza SSL correcto ---
+# --- Normaliza DATABASE_URL para MySQL + PyMySQL ---
 raw_url = os.getenv("DATABASE_URL", "")
 
-# Cambia mysql:// -> mysql+pymysql://
+# Asegura el driver correcto
 if raw_url.startswith("mysql://"):
     raw_url = raw_url.replace("mysql://", "mysql+pymysql://", 1)
 
-# Quita 'sslmode' si viene (propio de Postgres) y agrega 'ssl_mode=REQUIRED'
+# Limpia parámetros que no entiende PyMySQL
 u = urlparse(raw_url)
 q = dict(parse_qsl(u.query, keep_blank_values=True))
-q.pop("sslmode", None)              # elimina basura de Postgres
-q.setdefault("ssl_mode", "REQUIRED")  # exige SSL en MySQL/PyMySQL
+for k in ("sslmode", "ssl_mode", "ssl"):  # quitamos todos
+    q.pop(k, None)
 raw_url = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 app.config["SQLALCHEMY_DATABASE_URI"] = raw_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# ✅ Activa SSL correctamente para PyMySQL
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"connect_args": {"ssl": {}}}
+
 db = SQLAlchemy(app)
 
 # --------- Modelo ---------
@@ -40,7 +43,6 @@ class User(db.Model):
 def health():
     return jsonify(ok=True)
 
-# Inicializa tablas manualmente (llámalo una vez)
 @app.get("/init-db")
 def init_db():
     try:
