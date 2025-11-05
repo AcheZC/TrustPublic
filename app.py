@@ -1,7 +1,6 @@
 # app.py
 import os
 import datetime as dt
-from dataclasses import dataclass
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -11,7 +10,7 @@ import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # =========================
-# Config
+# Config desde entorno
 # =========================
 def env(name, default=None, cast=str):
     v = os.environ.get(name, default)
@@ -29,20 +28,26 @@ JWT_EXPIRES_HOURS = env("JWT_EXPIRES_HOURS", 72, int)
 INITIAL_WALLET = env("INITIAL_WALLET", 100, int)
 
 # =========================
-# App
+# App & CORS
 # =========================
 app = Flask(__name__)
-# CORS: permite tu dominio (puedes abrirlo con "*")
 CORS(app, resources={r"/*": {"origins": ["https://www.quantumsolutions.space", "https://quantumsolutions.space"]}})
 
 # =========================
-# DB helpers
+# DB helpers (con SSL/timeout)
 # =========================
 def get_conn():
-    return pymysql.connect(
+    """Conecta a MySQL con soporte opcional de SSL (MYSQL_SSL=1) y timeout."""
+    ssl_flag = os.environ.get("MYSQL_SSL") in ("1", "true", "TRUE")
+    kwargs = dict(
         host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS,
-        database=DB_NAME, charset="utf8mb4", cursorclass=DictCursor, autocommit=True
+        database=DB_NAME, charset="utf8mb4", cursorclass=DictCursor,
+        autocommit=True, connect_timeout=10
     )
+    if ssl_flag:
+        # Render/PlanetScale/Railway suelen aceptar dict vacío para activar TLS
+        kwargs["ssl"] = {"ssl": {}}
+    return pymysql.connect(**kwargs)
 
 def query(sql, params=None, one=False):
     with get_conn() as cn, cn.cursor() as cur:
@@ -108,7 +113,7 @@ def auth_required(fn):
             return jsonify({"error": "Token expired"}), 401
         except Exception:
             return jsonify({"error": "Invalid token"}), 401
-        request.user = payload  # attach
+        request.user = payload
         return fn(*args, **kwargs)
     return wrapper
 
@@ -134,7 +139,7 @@ def find_user_by_any(identifier: str):
     return None
 
 # =========================
-# Routes: Health
+# Health
 # =========================
 @app.get("/")
 def root():
@@ -166,7 +171,6 @@ def auth_register():
     token = make_token(uid, email, handle)
     return jsonify({"ok": True, "user": {"id": uid, "name": name, "email": email, "handle": handle}, "token": token})
 
-# Front intenta primero /auth/login; si no existe, cae a /api/login (lo proveemos igual)
 def _login_impl():
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
@@ -196,7 +200,6 @@ def api_login():
 def api_summary():
     sub = int(request.user["sub"])
 
-    # in (recibido), out (asignado)
     row_in  = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE to_user=%s", (sub,), one=True)
     row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
 
@@ -205,7 +208,6 @@ def api_summary():
 
     wallet = max(0, INITIAL_WALLET - total_out)
 
-    # últimos 10 eventos (anonimizando si quieres: quién emitió/recibió)
     events = query(
         """
         SELECT te.id, te.created_at,
@@ -222,20 +224,17 @@ def api_summary():
         (sub, sub)
     )
 
-    # Resumen en texto (opcional)
     summary = [
         f"Asignaste {total_out} tokens.",
         f"Recibiste {total_in} tokens.",
         f"Wallet disponible: {wallet}."
     ]
 
-    # Adaptación al dashboard simple (numéricos) y al UI de tabla
     feed = []
     for ev in events:
-        # Presentación genérica
         who = ev["from_handle"] or ev["from_email"] or "—"
         to  = ev["to_handle"]   or ev["to_email"]   or "—"
-        ev_type = "recibido" if (ev["to_email"] or ev["to_handle"]) else "mov"
+        ev_type = "recibido" if ev["to_email"] or ev["to_handle"] else "mov"
         feed.append({
             "who": f"{who} → {to}",
             "what": f"{('+' if (ev['to_email'] or ev['to_handle']) else '-')}{ev['amount']}",
@@ -243,14 +242,11 @@ def api_summary():
             "type": ev_type
         })
 
-    # Respuesta para ambos frontends (el “completo” y el “ligero”)
     return jsonify({
-        # para el dashboard “ligero”
         "out": total_out,
         "in": total_in,
         "wallet": wallet,
         "feed": feed,
-        # para el dashboard “completo”
         "trust_available": wallet,
         "reliability_total": total_in,
         "summary": summary,
@@ -282,12 +278,10 @@ def api_assign():
     if not to or amount <= 0:
         return jsonify({"error": "Parámetros inválidos"}), 400
 
-    # Destinatario por handle o email
     u_to = find_user_by_any(to)
     if not u_to:
         return jsonify({"error": "Destinatario no encontrado"}), 404
 
-    # Checar wallet disponible
     row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
     total_out = int(row_out["s"] if row_out and row_out["s"] is not None else 0)
     wallet = max(0, INITIAL_WALLET - total_out)
@@ -299,12 +293,11 @@ def api_assign():
         (sub, u_to["id"], amount, note)
     )
 
-    # Nuevo balance
     new_wallet = wallet - amount
     return jsonify({"success": True, "new_balance": new_wallet})
 
 # =========================
-# Error handlers amigables
+# Error handlers
 # =========================
 @app.errorhandler(404)
 def not_found(_):
@@ -318,5 +311,4 @@ def server_error(e):
 # Local run
 # =========================
 if __name__ == "__main__":
-    # Para pruebas locales
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
