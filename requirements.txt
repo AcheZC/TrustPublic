@@ -2,3 +2,5 @@ flask
 flask-cors
 flask_sqlalchemy
 pymysql
+bcrypt
+gunicorn
