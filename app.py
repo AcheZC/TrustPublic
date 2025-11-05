@@ -26,34 +26,32 @@ SECRET_KEY = env("SECRET_KEY", "change-me-dev")
 JWT_EXPIRES_HOURS = env("JWT_EXPIRES_HOURS", 72, int)
 INITIAL_WALLET = env("INITIAL_WALLET", 100, int)
 
-ALLOWED_ORIGINS = ("https://www.quantumsolutions.space", "https://quantumsolutions.space")
-
-# ========= App & CORS =========
+# ========= App & CORS (modo diagnóstico abierto) =========
 app = Flask(__name__)
 
-# CORS: declara orígenes, métodos y headers explícitos
+# 1) Permite todos los orígenes + métodos/headers usados por fetch
 CORS(
     app,
     resources={r"/*": {
-        "origins": list(ALLOWED_ORIGINS),
+        "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "max_age": 86400,
     }},
 )
 
-# Añade headers CORS a todas las respuestas (incluye preflight)
+# 2) Espeja el Origin en TODAS las respuestas (evita wildcard con credenciales)
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
-    if origin in ALLOWED_ORIGINS:
+    if origin:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
-# Respuesta genérica a preflights, por si algún decorador anula el OPTIONS automático
+# 3) Respuesta genérica a preflights (OPTIONS)
 @app.route("/<path:_any>", methods=["OPTIONS"])
 def cors_preflight(_any):
     return ("", 204)
@@ -73,7 +71,6 @@ def get_conn():
         kwargs["ssl"] = {"ssl": {}}
         if ssl_ca:
             kwargs["ssl"] = {"ca": ssl_ca}
-
     return pymysql.connect(**kwargs)
 
 def query(sql, params=None, one=False):
