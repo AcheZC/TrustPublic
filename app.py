@@ -1,7 +1,6 @@
 # app.py
 import os
 import datetime as dt
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pymysql
@@ -10,7 +9,7 @@ import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # =========================
-# Config desde entorno
+# Configuración
 # =========================
 def env(name, default=None, cast=str):
     v = os.environ.get(name, default)
@@ -28,16 +27,15 @@ JWT_EXPIRES_HOURS = env("JWT_EXPIRES_HOURS", 72, int)
 INITIAL_WALLET = env("INITIAL_WALLET", 100, int)
 
 # =========================
-# App & CORS
+# Flask y CORS
 # =========================
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://www.quantumsolutions.space", "https://quantumsolutions.space"]}})
 
 # =========================
-# DB helpers (con SSL/timeout)
+# Conexión MySQL
 # =========================
 def get_conn():
-    """Conecta a MySQL con soporte opcional de SSL (MYSQL_SSL=1) y timeout."""
     ssl_flag = os.environ.get("MYSQL_SSL") in ("1", "true", "TRUE")
     kwargs = dict(
         host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS,
@@ -45,7 +43,6 @@ def get_conn():
         autocommit=True, connect_timeout=10
     )
     if ssl_flag:
-        # Render/PlanetScale/Railway suelen aceptar dict vacío para activar TLS
         kwargs["ssl"] = {"ssl": {}}
     return pymysql.connect(**kwargs)
 
@@ -62,12 +59,12 @@ def execute(sql, params=None):
         return cur.lastrowid
 
 # =========================
-# Bootstrap (crea tablas si no existen)
+# Bootstrap — crea y corrige tablas
 # =========================
 def bootstrap():
     execute("""
     CREATE TABLE IF NOT EXISTS users (
-      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      id BIGINT UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT,
       name VARCHAR(120) NOT NULL,
       handle VARCHAR(80) UNIQUE,
       email VARCHAR(190) UNIQUE NOT NULL,
@@ -75,24 +72,74 @@ def bootstrap():
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+
     execute("""
     CREATE TABLE IF NOT EXISTS trust_events (
-      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      id BIGINT UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      from_user BIGINT NULL,
-      to_user   BIGINT NULL,
+      from_user BIGINT UNSIGNED NULL,
+      to_user   BIGINT UNSIGNED NULL,
       amount INT NOT NULL,
       note VARCHAR(255) NULL,
-      INDEX(from_user), INDEX(to_user),
-      CONSTRAINT fk_from FOREIGN KEY (from_user) REFERENCES users(id) ON DELETE SET NULL,
-      CONSTRAINT fk_to   FOREIGN KEY (to_user)   REFERENCES users(id) ON DELETE SET NULL
+      INDEX(from_user), INDEX(to_user)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+
+    # Normalizar tipos
+    try:
+        execute("ALTER TABLE users MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT;")
+    except Exception:
+        pass
+    for col in ("id", "from_user", "to_user"):
+        try:
+            execute(f"ALTER TABLE trust_events MODIFY {col} BIGINT UNSIGNED{' NOT NULL' if col=='id' else ' NULL'};")
+        except Exception:
+            pass
+
+    # Eliminar FKs viejas
+    try:
+        fks = query("""
+            SELECT CONSTRAINT_NAME
+            FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA=%s AND TABLE_NAME='trust_events' AND CONSTRAINT_TYPE='FOREIGN KEY'
+        """, (DB_NAME,))
+        for fk in fks:
+            name = fk["CONSTRAINT_NAME"]
+            if name in ("fk_from", "fk_to"):
+                try:
+                    execute(f"ALTER TABLE trust_events DROP FOREIGN KEY {name};")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Crear FKs correctas
+    def fk_exists(name):
+        row = query("""
+            SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA=%s AND TABLE_NAME='trust_events'
+              AND CONSTRAINT_TYPE='FOREIGN KEY' AND CONSTRAINT_NAME=%s
+            LIMIT 1
+        """, (DB_NAME, name), one=True)
+        return bool(row)
+
+    if not fk_exists("fk_from"):
+        execute("""
+            ALTER TABLE trust_events
+            ADD CONSTRAINT fk_from FOREIGN KEY (from_user)
+            REFERENCES users(id) ON DELETE SET NULL
+        """)
+    if not fk_exists("fk_to"):
+        execute("""
+            ALTER TABLE trust_events
+            ADD CONSTRAINT fk_to FOREIGN KEY (to_user)
+            REFERENCES users(id) ON DELETE SET NULL
+        """)
 
 bootstrap()
 
 # =========================
-# JWT helpers
+# JWT
 # =========================
 def make_token(user_id, email, handle=None):
     exp = dt.datetime.utcnow() + dt.timedelta(hours=JWT_EXPIRES_HOURS)
@@ -118,16 +165,10 @@ def auth_required(fn):
     return wrapper
 
 # =========================
-# Utils
+# Utilidades
 # =========================
-def clean_handle(s: str):
-    if not s: return None
-    s = s.strip()
-    if s.startswith("@"): s = s[1:]
-    return s or None
-
-def find_user_by_any(identifier: str):
-    """Busca por handle o email."""
+def clean_handle(s): return s.strip()[1:] if s and s.startswith("@") else s.strip()
+def find_user_by_any(identifier):
     if not identifier: return None
     handle = clean_handle(identifier)
     if "@" in identifier and "." in identifier:
@@ -139,176 +180,72 @@ def find_user_by_any(identifier: str):
     return None
 
 # =========================
-# Health
+# Rutas principales
 # =========================
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "trust-public", "time": dt.datetime.utcnow().isoformat()})
 
-# =========================
-# Auth: Register / Login
-# =========================
 @app.post("/auth/register")
-def auth_register():
-    data = request.get_json(force=True, silent=True) or {}
-    name   = (data.get("name") or "").strip()
-    handle = clean_handle(data.get("handle") or "")
-    email  = (data.get("email") or "").strip().lower()
-    pw     = data.get("password") or ""
-
-    if not name or not email or not pw or not handle:
-        return jsonify({"error": "Datos incompletos"}), 400
-
-    if query("SELECT id FROM users WHERE email=%s", (email,), one=True):
-        return jsonify({"error": "Email ya registrado"}), 409
-    if handle and query("SELECT id FROM users WHERE handle=%s", (handle,), one=True):
-        return jsonify({"error": "Usuario ya existe"}), 409
-
-    uid = execute(
-        "INSERT INTO users(name,handle,email,password_hash) VALUES(%s,%s,%s,%s)",
-        (name, handle, email, generate_password_hash(pw))
-    )
-    token = make_token(uid, email, handle)
-    return jsonify({"ok": True, "user": {"id": uid, "name": name, "email": email, "handle": handle}, "token": token})
-
-def _login_impl():
-    data = request.get_json(force=True, silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    pw    = data.get("password") or ""
-    if not email or not pw:
-        return jsonify({"error": "Email y contraseña requeridos"}), 400
-    u = query("SELECT * FROM users WHERE email=%s", (email,), one=True)
-    if not u or not check_password_hash(u["password_hash"], pw):
-        return jsonify({"error": "Credenciales inválidas"}), 401
-    token = make_token(u["id"], u["email"], u.get("handle"))
-    user_payload = {"id": u["id"], "email": u["email"], "handle": u.get("handle"), "name": u.get("name")}
-    return jsonify({"token": token, "user": user_payload})
+def register():
+    d = request.get_json(force=True) or {}
+    name, handle, email, pw = d.get("name",""), clean_handle(d.get("handle","")), d.get("email","").lower(), d.get("password","")
+    if not all([name, handle, email, pw]): return jsonify({"error":"Datos incompletos"}),400
+    if query("SELECT id FROM users WHERE email=%s",(email,),one=True): return jsonify({"error":"Email ya registrado"}),409
+    uid=execute("INSERT INTO users(name,handle,email,password_hash) VALUES(%s,%s,%s,%s)",
+        (name,handle,email,generate_password_hash(pw)))
+    token=make_token(uid,email,handle)
+    return jsonify({"ok":True,"user":{"id":uid,"name":name,"email":email,"handle":handle},"token":token})
 
 @app.post("/auth/login")
-def auth_login():
-    return _login_impl()
+def login():
+    d=request.get_json(force=True) or {}
+    email,pw=d.get("email","").lower(),d.get("password","")
+    u=query("SELECT * FROM users WHERE email=%s",(email,),one=True)
+    if not u or not check_password_hash(u["password_hash"],pw):
+        return jsonify({"error":"Credenciales inválidas"}),401
+    token=make_token(u["id"],u["email"],u.get("handle"))
+    return jsonify({"token":token,"user":{"id":u["id"],"email":u["email"],"handle":u.get("handle"),"name":u.get("name")}})
 
-@app.post("/api/login")
-def api_login():
-    return _login_impl()
-
-# =========================
-# Summary
-# =========================
 @app.get("/api/summary")
 @auth_required
-def api_summary():
-    sub = int(request.user["sub"])
-
-    row_in  = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE to_user=%s", (sub,), one=True)
-    row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
-
-    total_in  = int(row_in["s"] if row_in and row_in["s"] is not None else 0)
-    total_out = int(row_out["s"] if row_out and row_out["s"] is not None else 0)
-
-    wallet = max(0, INITIAL_WALLET - total_out)
-
-    events = query(
-        """
-        SELECT te.id, te.created_at,
-               fu.handle AS from_handle, fu.email AS from_email,
-               tu.handle AS to_handle,   tu.email AS to_email,
-               te.amount, te.note
+def summary():
+    sub=int(request.user["sub"])
+    row_in=query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE to_user=%s",(sub,),one=True)
+    row_out=query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s",(sub,),one=True)
+    total_in,total_out=int(row_in["s"]),int(row_out["s"])
+    wallet=max(0,INITIAL_WALLET-total_out)
+    events=query("""
+        SELECT te.created_at,fu.handle AS from_handle,fu.email AS from_email,
+               tu.handle AS to_handle,tu.email AS to_email,te.amount
         FROM trust_events te
-        LEFT JOIN users fu ON fu.id = te.from_user
-        LEFT JOIN users tu ON tu.id = te.to_user
+        LEFT JOIN users fu ON fu.id=te.from_user
+        LEFT JOIN users tu ON tu.id=te.to_user
         WHERE te.from_user=%s OR te.to_user=%s
-        ORDER BY te.created_at DESC
-        LIMIT 10
-        """,
-        (sub, sub)
-    )
+        ORDER BY te.created_at DESC LIMIT 10
+    """,(sub,sub))
+    feed=[{"who":f"{ev['from_handle'] or ev['from_email']} → {ev['to_handle'] or ev['to_email']}",
+           "what":f"+{ev['amount']}" if ev["to_email"] else f"-{ev['amount']}",
+           "when":ev["created_at"].strftime("%Y-%m-%d %H:%M"),"type":"mov"} for ev in events]
+    return jsonify({"out":total_out,"in":total_in,"wallet":wallet,"feed":feed})
 
-    summary = [
-        f"Asignaste {total_out} tokens.",
-        f"Recibiste {total_in} tokens.",
-        f"Wallet disponible: {wallet}."
-    ]
-
-    feed = []
-    for ev in events:
-        who = ev["from_handle"] or ev["from_email"] or "—"
-        to  = ev["to_handle"]   or ev["to_email"]   or "—"
-        ev_type = "recibido" if ev["to_email"] or ev["to_handle"] else "mov"
-        feed.append({
-            "who": f"{who} → {to}",
-            "what": f"{('+' if (ev['to_email'] or ev['to_handle']) else '-')}{ev['amount']}",
-            "when": ev["created_at"].strftime("%Y-%m-%d %H:%M"),
-            "type": ev_type
-        })
-
-    return jsonify({
-        "out": total_out,
-        "in": total_in,
-        "wallet": wallet,
-        "feed": feed,
-        "trust_available": wallet,
-        "reliability_total": total_in,
-        "summary": summary,
-        "events": [
-            {
-                "created_at": ev["created_at"].isoformat(),
-                "type": "assign" if ev["from_email"] else "receive",
-                "from": ev["from_email"] or ev["from_handle"],
-                "to": ev["to_email"] or ev["to_handle"],
-                "amount": ev["amount"],
-                "note": ev["note"] or ""
-            } for ev in events
-        ]
-    })
-
-# =========================
-# Assign
-# =========================
 @app.post("/api/assign")
 @auth_required
-def api_assign():
-    sub = int(request.user["sub"])
-    data = request.get_json(force=True, silent=True) or {}
-
-    to = (data.get("to") or "").strip()
-    amount = int(data.get("amount") or 0)
-    note = (data.get("note") or "").strip()[:255] or None
-
-    if not to or amount <= 0:
-        return jsonify({"error": "Parámetros inválidos"}), 400
-
-    u_to = find_user_by_any(to)
-    if not u_to:
-        return jsonify({"error": "Destinatario no encontrado"}), 404
-
-    row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
-    total_out = int(row_out["s"] if row_out and row_out["s"] is not None else 0)
-    wallet = max(0, INITIAL_WALLET - total_out)
-    if amount > wallet:
-        return jsonify({"error": "Fondos de confianza insuficientes"}), 400
-
-    execute(
-        "INSERT INTO trust_events(from_user,to_user,amount,note) VALUES(%s,%s,%s,%s)",
-        (sub, u_to["id"], amount, note)
-    )
-
-    new_wallet = wallet - amount
-    return jsonify({"success": True, "new_balance": new_wallet})
-
-# =========================
-# Error handlers
-# =========================
-@app.errorhandler(404)
-def not_found(_):
-    return jsonify({"error": "Not found"}), 404
+def assign():
+    sub=int(request.user["sub"])
+    d=request.get_json(force=True) or {}
+    to,amount=d.get("to","").strip(),int(d.get("amount") or 0)
+    if not to or amount<=0: return jsonify({"error":"Parámetros inválidos"}),400
+    u_to=find_user_by_any(to)
+    if not u_to: return jsonify({"error":"Destinatario no encontrado"}),404
+    row_out=query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s",(sub,),one=True)
+    wallet=max(0,INITIAL_WALLET-int(row_out["s"]))
+    if amount>wallet: return jsonify({"error":"Fondos de confianza insuficientes"}),400
+    execute("INSERT INTO trust_events(from_user,to_user,amount) VALUES(%s,%s,%s)",(sub,u_to["id"],amount))
+    return jsonify({"success":True,"new_balance":wallet-amount})
 
 @app.errorhandler(500)
-def server_error(e):
-    return jsonify({"error": "Server error", "detail": str(e)}), 500
+def server_error(e): return jsonify({"error":"Server error","detail":str(e)}),500
 
-# =========================
-# Local run
-# =========================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",5000)))
