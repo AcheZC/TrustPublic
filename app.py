@@ -1,123 +1,322 @@
+# app.py
 import os
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
-from flask import Flask, jsonify, request
+import datetime as dt
+from dataclasses import dataclass
+
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+import pymysql
+from pymysql.cursors import DictCursor
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
 
+# =========================
+# Config
+# =========================
+def env(name, default=None, cast=str):
+    v = os.environ.get(name, default)
+    if v is None:
+        return None
+    return cast(v) if cast and v != "" else v
+
+DB_HOST = env("MYSQL_HOST", "localhost")
+DB_PORT = env("MYSQL_PORT", 3306, int)
+DB_NAME = env("MYSQL_DB", "trustdb")
+DB_USER = env("MYSQL_USER", "root")
+DB_PASS = env("MYSQL_PASSWORD", "")
+SECRET_KEY = env("SECRET_KEY", "change-me-dev")
+JWT_EXPIRES_HOURS = env("JWT_EXPIRES_HOURS", 72, int)
+INITIAL_WALLET = env("INITIAL_WALLET", 100, int)
+
+# =========================
+# App
+# =========================
 app = Flask(__name__)
-# Si vas a llamar desde Systeme.io y NO usas cookies, * está bien.
-CORS(app, resources={r"/*": {"origins": "*"}})
+# CORS: permite tu dominio (puedes abrirlo con "*")
+CORS(app, resources={r"/*": {"origins": ["https://www.quantumsolutions.space", "https://quantumsolutions.space"]}})
 
-# --- Normaliza DATABASE_URL para MySQL + PyMySQL ---
-raw_url = os.getenv("DATABASE_URL", "")
+# =========================
+# DB helpers
+# =========================
+def get_conn():
+    return pymysql.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS,
+        database=DB_NAME, charset="utf8mb4", cursorclass=DictCursor, autocommit=True
+    )
 
-# Asegura el driver correcto
-if raw_url.startswith("mysql://"):
-    raw_url = raw_url.replace("mysql://", "mysql+pymysql://", 1)
+def query(sql, params=None, one=False):
+    with get_conn() as cn, cn.cursor() as cur:
+        cur.execute(sql, params or ())
+        rows = cur.fetchall()
+    return (rows[0] if rows else None) if one else rows
 
-# Limpia parámetros que no entiende PyMySQL
-u = urlparse(raw_url)
-q = dict(parse_qsl(u.query, keep_blank_values=True))
-for k in ("sslmode", "ssl_mode", "ssl"):  # quitamos todos
-    q.pop(k, None)
-raw_url = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
+def execute(sql, params=None):
+    with get_conn() as cn, cn.cursor() as cur:
+        cur.execute(sql, params or ())
+        cn.commit()
+        return cur.lastrowid
 
-app.config["SQLALCHEMY_DATABASE_URI"] = raw_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# =========================
+# Bootstrap (crea tablas si no existen)
+# =========================
+def bootstrap():
+    execute("""
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      name VARCHAR(120) NOT NULL,
+      handle VARCHAR(80) UNIQUE,
+      email VARCHAR(190) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
+    execute("""
+    CREATE TABLE IF NOT EXISTS trust_events (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      from_user BIGINT NULL,
+      to_user   BIGINT NULL,
+      amount INT NOT NULL,
+      note VARCHAR(255) NULL,
+      INDEX(from_user), INDEX(to_user),
+      CONSTRAINT fk_from FOREIGN KEY (from_user) REFERENCES users(id) ON DELETE SET NULL,
+      CONSTRAINT fk_to   FOREIGN KEY (to_user)   REFERENCES users(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
 
-# Conexión robusta con pool mínimo y timeouts (evita cuelgues en planes gratis)
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_size": 1,
-    "max_overflow": 0,
-    "pool_recycle": 240,
-    "pool_pre_ping": True,
-    "connect_args": {
-        "ssl": {},              # muchos proveedores requieren TLS
-        "connect_timeout": 5,
-        "read_timeout": 5,
-        "write_timeout": 5,
-    },
-}
+bootstrap()
 
-db = SQLAlchemy(app)
+# =========================
+# JWT helpers
+# =========================
+def make_token(user_id, email, handle=None):
+    exp = dt.datetime.utcnow() + dt.timedelta(hours=JWT_EXPIRES_HOURS)
+    payload = {"sub": str(user_id), "email": email, "handle": handle, "exp": exp}
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
-# --------- Modelo ---------
-class User(db.Model):
-    __tablename__ = "users"
-    id       = db.Column(db.Integer, primary_key=True)
-    name     = db.Column(db.String(80),  nullable=False)
-    handle   = db.Column(db.String(50),  nullable=False, unique=True, index=True)
-    email    = db.Column(db.String(120), nullable=False, unique=True, index=True)
-    password = db.Column(db.String(120), nullable=False)  # TODO: hash (cuando quieras)
-    code     = db.Column(db.String(120))
+def auth_required(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth.split(" ", 1)[1].strip()
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        request.user = payload  # attach
+        return fn(*args, **kwargs)
+    return wrapper
 
-# --------- Healths ---------
-@app.get("/health")
-def health():
-    return jsonify(ok=True)
+# =========================
+# Utils
+# =========================
+def clean_handle(s: str):
+    if not s: return None
+    s = s.strip()
+    if s.startswith("@"): s = s[1:]
+    return s or None
 
-@app.get("/db/health")
-def db_health():
-    with db.engine.connect() as c:
-        ok = c.execute(text("SELECT 1")).scalar() == 1
-    return {"ok": ok}
+def find_user_by_any(identifier: str):
+    """Busca por handle o email."""
+    if not identifier: return None
+    handle = clean_handle(identifier)
+    if "@" in identifier and "." in identifier:
+        u = query("SELECT * FROM users WHERE email=%s", (identifier,), one=True)
+        if u: return u
+    if handle:
+        u = query("SELECT * FROM users WHERE handle=%s", (handle,), one=True)
+        if u: return u
+    return None
 
-# --------- Init ---------
-@app.get("/init-db")
-def init_db():
-    try:
-        db.create_all()
-        return jsonify(ok=True, msg="Tablas listas")
-    except Exception as e:
-        return (f"DB init error: {e}", 500)
+# =========================
+# Routes: Health
+# =========================
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "trust-public", "time": dt.datetime.utcnow().isoformat()})
 
-# --------- Registro ---------
+# =========================
+# Auth: Register / Login
+# =========================
 @app.post("/auth/register")
-def register():
-    data = request.get_json(force=True) or {}
-    required = ["name", "handle", "email", "password"]
-    if any(not data.get(k) for k in required):
-        return ("Faltan campos", 400)
-    try:
-        u = User(
-            name=data["name"].strip(),
-            handle=data["handle"].strip(),
-            email=data["email"].strip().lower(),
-            password=data["password"],  # TODO: reemplazar por hash cuando toque
-            code=(data.get("code") or "").strip()
-        )
-        db.session.add(u)
-        db.session.commit()
-        return jsonify(ok=True, msg="Cuenta guardada en DB"), 201
-    except IntegrityError:
-        db.session.rollback()
-        return ("Email o usuario ya registrados.", 409)
-    except Exception as e:
-        db.session.rollback()
-        return (f"Error del servidor: {e}", 500)
+def auth_register():
+    data = request.get_json(force=True, silent=True) or {}
+    name   = (data.get("name") or "").strip()
+    handle = clean_handle(data.get("handle") or "")
+    email  = (data.get("email") or "").strip().lower()
+    pw     = data.get("password") or ""
 
-# --------- SUMMARY (público, sin auth por ahora) ---------
+    if not name or not email or not pw or not handle:
+        return jsonify({"error": "Datos incompletos"}), 400
+
+    if query("SELECT id FROM users WHERE email=%s", (email,), one=True):
+        return jsonify({"error": "Email ya registrado"}), 409
+    if handle and query("SELECT id FROM users WHERE handle=%s", (handle,), one=True):
+        return jsonify({"error": "Usuario ya existe"}), 409
+
+    uid = execute(
+        "INSERT INTO users(name,handle,email,password_hash) VALUES(%s,%s,%s,%s)",
+        (name, handle, email, generate_password_hash(pw))
+    )
+    token = make_token(uid, email, handle)
+    return jsonify({"ok": True, "user": {"id": uid, "name": name, "email": email, "handle": handle}, "token": token})
+
+# Front intenta primero /auth/login; si no existe, cae a /api/login (lo proveemos igual)
+def _login_impl():
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    pw    = data.get("password") or ""
+    if not email or not pw:
+        return jsonify({"error": "Email y contraseña requeridos"}), 400
+    u = query("SELECT * FROM users WHERE email=%s", (email,), one=True)
+    if not u or not check_password_hash(u["password_hash"], pw):
+        return jsonify({"error": "Credenciales inválidas"}), 401
+    token = make_token(u["id"], u["email"], u.get("handle"))
+    user_payload = {"id": u["id"], "email": u["email"], "handle": u.get("handle"), "name": u.get("name")}
+    return jsonify({"token": token, "user": user_payload})
+
+@app.post("/auth/login")
+def auth_login():
+    return _login_impl()
+
+@app.post("/api/login")
+def api_login():
+    return _login_impl()
+
+# =========================
+# Summary
+# =========================
 @app.get("/api/summary")
+@auth_required
 def api_summary():
-    # Placeholder del servidor (luego se hará real con la DB)
-    data = {
-        "out": 12,
-        "in": 27,
-        "wallet": 88,
-        "feed": [
-            {"who": "@Lingualux", "what": "+3",  "when": "hoy 10:15",  "type": "recibido"},
-            {"who": "@Dany",      "what": "-2",  "when": "ayer 21:02", "type": "asignado"},
-            {"who": "@ColegioX",  "what": "+10", "when": "ayer 18:40", "type": "recibido"},
-        ]
-    }
-    # Anonimiza el emisor cuando es "recibido"
-    for x in data["feed"]:
-        if x.get("type") == "recibido":
-            x["who"] = "Fuente anónima"
-    return jsonify(ok=True, **data)
+    sub = int(request.user["sub"])
 
+    # in (recibido), out (asignado)
+    row_in  = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE to_user=%s", (sub,), one=True)
+    row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
+
+    total_in  = int(row_in["s"] if row_in and row_in["s"] is not None else 0)
+    total_out = int(row_out["s"] if row_out and row_out["s"] is not None else 0)
+
+    wallet = max(0, INITIAL_WALLET - total_out)
+
+    # últimos 10 eventos (anonimizando si quieres: quién emitió/recibió)
+    events = query(
+        """
+        SELECT te.id, te.created_at,
+               fu.handle AS from_handle, fu.email AS from_email,
+               tu.handle AS to_handle,   tu.email AS to_email,
+               te.amount, te.note
+        FROM trust_events te
+        LEFT JOIN users fu ON fu.id = te.from_user
+        LEFT JOIN users tu ON tu.id = te.to_user
+        WHERE te.from_user=%s OR te.to_user=%s
+        ORDER BY te.created_at DESC
+        LIMIT 10
+        """,
+        (sub, sub)
+    )
+
+    # Resumen en texto (opcional)
+    summary = [
+        f"Asignaste {total_out} tokens.",
+        f"Recibiste {total_in} tokens.",
+        f"Wallet disponible: {wallet}."
+    ]
+
+    # Adaptación al dashboard simple (numéricos) y al UI de tabla
+    feed = []
+    for ev in events:
+        # Presentación genérica
+        who = ev["from_handle"] or ev["from_email"] or "—"
+        to  = ev["to_handle"]   or ev["to_email"]   or "—"
+        ev_type = "recibido" if (ev["to_email"] or ev["to_handle"]) else "mov"
+        feed.append({
+            "who": f"{who} → {to}",
+            "what": f"{('+' if (ev['to_email'] or ev['to_handle']) else '-')}{ev['amount']}",
+            "when": ev["created_at"].strftime("%Y-%m-%d %H:%M"),
+            "type": ev_type
+        })
+
+    # Respuesta para ambos frontends (el “completo” y el “ligero”)
+    return jsonify({
+        # para el dashboard “ligero”
+        "out": total_out,
+        "in": total_in,
+        "wallet": wallet,
+        "feed": feed,
+        # para el dashboard “completo”
+        "trust_available": wallet,
+        "reliability_total": total_in,
+        "summary": summary,
+        "events": [
+            {
+                "created_at": ev["created_at"].isoformat(),
+                "type": "assign" if ev["from_email"] else "receive",
+                "from": ev["from_email"] or ev["from_handle"],
+                "to": ev["to_email"] or ev["to_handle"],
+                "amount": ev["amount"],
+                "note": ev["note"] or ""
+            } for ev in events
+        ]
+    })
+
+# =========================
+# Assign
+# =========================
+@app.post("/api/assign")
+@auth_required
+def api_assign():
+    sub = int(request.user["sub"])
+    data = request.get_json(force=True, silent=True) or {}
+
+    to = (data.get("to") or "").strip()
+    amount = int(data.get("amount") or 0)
+    note = (data.get("note") or "").strip()[:255] or None
+
+    if not to or amount <= 0:
+        return jsonify({"error": "Parámetros inválidos"}), 400
+
+    # Destinatario por handle o email
+    u_to = find_user_by_any(to)
+    if not u_to:
+        return jsonify({"error": "Destinatario no encontrado"}), 404
+
+    # Checar wallet disponible
+    row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
+    total_out = int(row_out["s"] if row_out and row_out["s"] is not None else 0)
+    wallet = max(0, INITIAL_WALLET - total_out)
+    if amount > wallet:
+        return jsonify({"error": "Fondos de confianza insuficientes"}), 400
+
+    execute(
+        "INSERT INTO trust_events(from_user,to_user,amount,note) VALUES(%s,%s,%s,%s)",
+        (sub, u_to["id"], amount, note)
+    )
+
+    # Nuevo balance
+    new_wallet = wallet - amount
+    return jsonify({"success": True, "new_balance": new_wallet})
+
+# =========================
+# Error handlers amigables
+# =========================
+@app.errorhandler(404)
+def not_found(_):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"error": "Server error", "detail": str(e)}), 500
+
+# =========================
+# Local run
+# =========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    # Para pruebas locales
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
