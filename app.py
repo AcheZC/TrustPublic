@@ -1,13 +1,14 @@
 # app.py
 import os
 import datetime as dt
+from functools import wraps
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pymysql
 from pymysql.cursors import DictCursor
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
 
 # ========= Config =========
 def env(name, default=None, cast=str):
@@ -25,15 +26,43 @@ SECRET_KEY = env("SECRET_KEY", "change-me-dev")
 JWT_EXPIRES_HOURS = env("JWT_EXPIRES_HOURS", 72, int)
 INITIAL_WALLET = env("INITIAL_WALLET", 100, int)
 
+ALLOWED_ORIGINS = ("https://www.quantumsolutions.space", "https://quantumsolutions.space")
+
 # ========= App & CORS =========
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["https://www.quantumsolutions.space", "https://quantumsolutions.space"]}})
+
+# CORS: declara orígenes, métodos y headers explícitos
+CORS(
+    app,
+    resources={r"/*": {
+        "origins": list(ALLOWED_ORIGINS),
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "max_age": 86400,
+    }},
+)
+
+# Añade headers CORS a todas las respuestas (incluye preflight)
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get("Origin")
+    if origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
+
+# Respuesta genérica a preflights, por si algún decorador anula el OPTIONS automático
+@app.route("/<path:_any>", methods=["OPTIONS"])
+def cors_preflight(_any):
+    return ("", 204)
 
 # ========= DB helpers =========
 def get_conn():
     """Conecta a MySQL con SSL opcional (MYSQL_SSL=1) y CA (MYSQL_SSL_CA)."""
     ssl_flag = os.environ.get("MYSQL_SSL") in ("1", "true", "TRUE")
-    ssl_ca = os.environ.get("MYSQL_SSL_CA")  # opcional, p.ej. /etc/ssl/certs/ca-certificates.crt
+    ssl_ca = os.environ.get("MYSQL_SSL_CA")  # opcional
 
     kwargs = dict(
         host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS,
@@ -43,7 +72,6 @@ def get_conn():
     if ssl_flag:
         kwargs["ssl"] = {"ssl": {}}
         if ssl_ca:
-            # Si tu proveedor requiere validar CA explícita
             kwargs["ssl"] = {"ca": ssl_ca}
 
     return pymysql.connect(**kwargs)
@@ -87,15 +115,13 @@ def bootstrap():
       INDEX(from_user), INDEX(to_user)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
-
-    # Normaliza tipos (por si existían distintos)
+    # Normaliza tipos por si existían distintos
     try: execute("ALTER TABLE users MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT;")
     except Exception: pass
     for col in ("id", "from_user", "to_user"):
         try: execute(f"ALTER TABLE trust_events MODIFY {col} BIGINT UNSIGNED{' NOT NULL' if col=='id' else ' NULL'};")
         except Exception: pass
-
-    # Dropea FKs viejas incompatibles
+    # Dropea FKs incompatibles
     try:
         fks = query("""
             SELECT CONSTRAINT_NAME
@@ -108,7 +134,6 @@ def bootstrap():
                 except Exception: pass
     except Exception:
         pass
-
     # Crea FKs correctas si faltan
     def fk_exists(name):
         row = query("""
@@ -118,7 +143,6 @@ def bootstrap():
             LIMIT 1
         """, (DB_NAME, name), one=True)
         return bool(row)
-
     if not fk_exists("fk_from"):
         execute("""
             ALTER TABLE trust_events
@@ -174,15 +198,13 @@ def find_user_by_any(identifier):
         if u: return u
     return None
 
-# ========= Health checks =========
+# ========= Health =========
 @app.get("/health")
 def health():
-    # No toca la DB → Render lo usa para marcar "UP"
     return jsonify({"status": "ok"}), 200
 
 @app.get("/ready")
 def ready():
-    # Toca DB sin mutar; útil para verificar conexión
     try:
         ensure_bootstrap()
         query("SELECT 1", one=True)
@@ -200,45 +222,46 @@ def register():
     ensure_bootstrap()
     d = request.get_json(force=True) or {}
     name, handle, email, pw = d.get("name","").strip(), clean_handle(d.get("handle","")), (d.get("email","") or "").lower().strip(), d.get("password","")
-    if not all([name, handle, email, pw]): return jsonify({"error":"Datos incompletos"}),400
-    if query("SELECT id FROM users WHERE email=%s",(email,),one=True): return jsonify({"error":"Email ya registrado"}),409
-    uid=execute("INSERT INTO users(name,handle,email,password_hash) VALUES(%s,%s,%s,%s)", (name,handle,email,generate_password_hash(pw)))
-    token=make_token(uid,email,handle)
-    return jsonify({"ok":True,"user":{"id":uid,"name":name,"email":email,"handle":handle},"token":token})
+    if not all([name, handle, email, pw]): return jsonify({"error":"Datos incompletos"}), 400
+    if query("SELECT id FROM users WHERE email=%s", (email,), one=True): return jsonify({"error":"Email ya registrado"}), 409
+    uid = execute("INSERT INTO users(name,handle,email,password_hash) VALUES(%s,%s,%s,%s)", (name, handle, email, generate_password_hash(pw)))
+    token = make_token(uid, email, handle)
+    return jsonify({"ok": True, "user": {"id": uid, "name": name, "email": email, "handle": handle}, "token": token})
 
 @app.post("/auth/login")
 def login():
     ensure_bootstrap()
-    d=request.get_json(force=True) or {}
-    email,pw=(d.get("email","") or "").lower().strip(), d.get("password","") or ""
-    u=query("SELECT * FROM users WHERE email=%s",(email,),one=True)
-    if not u or not check_password_hash(u["password_hash"],pw):
-        return jsonify({"error":"Credenciales inválidas"}),401
-    token=make_token(u["id"],u["email"],u.get("handle"))
-    return jsonify({"token":token,"user":{"id":u["id"],"email":u["email"],"handle":u.get("handle"),"name":u.get("name")}})
+    d = request.get_json(force=True) or {}
+    email, pw = (d.get("email","") or "").lower().strip(), d.get("password","") or ""
+    u = query("SELECT * FROM users WHERE email=%s", (email,), one=True)
+    if not u or not check_password_hash(u["password_hash"], pw):
+        return jsonify({"error":"Credenciales inválidas"}), 401
+    token = make_token(u["id"], u["email"], u.get("handle"))
+    return jsonify({"token": token, "user": {"id": u["id"], "email": u["email"], "handle": u.get("handle"), "name": u.get("name")}})
 
 @app.get("/api/summary")
 @auth_required
 def summary():
     ensure_bootstrap()
-    sub=int(request.user["sub"])
-    row_in = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE to_user=%s",(sub,),one=True)
-    row_out= query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s",(sub,),one=True)
+    sub = int(request.user["sub"])
+    row_in  = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE to_user=%s", (sub,), one=True)
+    row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
     total_in  = int(row_in["s"] if row_in and row_in["s"] is not None else 0)
     total_out = int(row_out["s"] if row_out and row_out["s"] is not None else 0)
     wallet = max(0, INITIAL_WALLET - total_out)
-    events=query("""
-        SELECT te.created_at,fu.handle AS from_handle,fu.email AS from_email,
-               tu.handle AS to_handle,tu.email AS to_email,te.amount, te.to_user
+    events = query("""
+        SELECT te.created_at, fu.handle AS from_handle, fu.email AS from_email,
+               tu.handle AS to_handle, tu.email AS to_email, te.amount, te.to_user
         FROM trust_events te
-        LEFT JOIN users fu ON fu.id=te.from_user
-        LEFT JOIN users tu ON tu.id=te.to_user
+        LEFT JOIN users fu ON fu.id = te.from_user
+        LEFT JOIN users tu ON tu.id = te.to_user
         WHERE te.from_user=%s OR te.to_user=%s
-        ORDER BY te.created_at DESC LIMIT 10
-    """,(sub,sub))
-    feed=[{
+        ORDER BY te.created_at DESC
+        LIMIT 10
+    """, (sub, sub))
+    feed = [{
         "who": f"{ev['from_handle'] or ev['from_email']} → {ev['to_handle'] or ev['to_email']}",
-        "what": f"+{ev['amount']}" if ev["to_user"]==sub else f"-{ev['amount']}",
+        "what": f"+{ev['amount']}" if ev["to_user"] == sub else f"-{ev['amount']}",
         "when": ev["created_at"].strftime("%Y-%m-%d %H:%M"),
         "type": "mov"
     } for ev in events]
@@ -248,22 +271,22 @@ def summary():
 @auth_required
 def assign():
     ensure_bootstrap()
-    sub=int(request.user["sub"])
-    d=request.get_json(force=True) or {}
-    to,amount=(d.get("to","") or "").strip(), int(d.get("amount") or 0)
-    note=(d.get("note") or "").strip()[:255] or None
-    if not to or amount<=0: return jsonify({"error":"Parámetros inválidos"}),400
-    u_to=find_user_by_any(to)
-    if not u_to: return jsonify({"error":"Destinatario no encontrado"}),404
-    row_out=query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s",(sub,),one=True)
-    wallet=max(0, INITIAL_WALLET - int(row_out["s"] or 0))
-    if amount>wallet: return jsonify({"error":"Fondos de confianza insuficientes"}),400
-    execute("INSERT INTO trust_events(from_user,to_user,amount,note) VALUES(%s,%s,%s,%s)",(sub,u_to["id"],amount,note))
-    return jsonify({"success":True,"new_balance":wallet-amount})
+    sub = int(request.user["sub"])
+    d = request.get_json(force=True) or {}
+    to, amount = (d.get("to","") or "").strip(), int(d.get("amount") or 0)
+    note = (d.get("note") or "").strip()[:255] or None
+    if not to or amount <= 0: return jsonify({"error":"Parámetros inválidos"}), 400
+    u_to = find_user_by_any(to)
+    if not u_to: return jsonify({"error":"Destinatario no encontrado"}), 404
+    row_out = query("SELECT COALESCE(SUM(amount),0) AS s FROM trust_events WHERE from_user=%s", (sub,), one=True)
+    wallet = max(0, INITIAL_WALLET - int(row_out["s"] or 0))
+    if amount > wallet: return jsonify({"error":"Fondos de confianza insuficientes"}), 400
+    execute("INSERT INTO trust_events(from_user,to_user,amount,note) VALUES(%s,%s,%s,%s)", (sub, u_to["id"], amount, note))
+    return jsonify({"success": True, "new_balance": wallet - amount})
 
 @app.errorhandler(500)
 def server_error(e):
-    return jsonify({"error":"Server error","detail": str(e)}),500
+    return jsonify({"error": "Server error", "detail": str(e)}), 500
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
